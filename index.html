@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Utility Bill Extractor</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #171d2b;
+    --panel-2: #1e2637;
+    --border: #2a3346;
+    --text: #e7ecf4;
+    --muted: #93a0b8;
+    --accent: #4f8cff;
+    --accent-2: #2f6be0;
+    --ok: #3ecf8e;
+    --warn: #f0b429;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6fb; --panel: #ffffff; --panel-2: #f7f9fd; --border: #e2e7f0;
+      --text: #1a2230; --muted: #5a6680; --accent: #2f6be0; --accent-2: #2559c4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .drop {
+    border: 2px dashed var(--border); border-radius: 14px; background: var(--panel);
+    padding: 40px 24px; text-align: center; cursor: pointer; transition: .15s;
+  }
+  .drop:hover, .drop.hot { border-color: var(--accent); background: var(--panel-2); }
+  .drop strong { color: var(--accent); }
+  .drop small { color: var(--muted); display: block; margin-top: 8px; }
+  input[type=file] { display: none; }
+  .bar { display: flex; gap: 10px; align-items: center; margin: 20px 0 12px; flex-wrap: wrap; }
+  .bar .spacer { flex: 1; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 9px;
+    padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer; transition: .15s;
+  }
+  button:hover { background: var(--accent-2); }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .status { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; background: var(--panel); border-radius: 12px; overflow: hidden; }
+  thead th {
+    text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); padding: 12px 14px; background: var(--panel-2); border-bottom: 1px solid var(--border);
+  }
+  tbody td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.editable { outline: none; }
+  td.editable:focus { background: rgba(79,140,255,.12); box-shadow: inset 0 0 0 1px var(--accent); border-radius: 4px; }
+  td.file { color: var(--muted); font-size: 13px; max-width: 240px; word-break: break-word; }
+  td.empty { color: var(--warn); font-style: italic; }
+  .row-actions button { background: transparent; color: var(--muted); border: 0; padding: 2px 6px; font-size: 12px; }
+  .row-actions button:hover { color: var(--accent); }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 14px; }
+  dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--panel); color: var(--text); max-width: 720px; width: 92%; padding: 0; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog header { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  dialog pre { margin: 0; padding: 18px; max-height: 60vh; overflow: auto; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Utility Bill Extractor</h1>
+  <p class="sub">Drop utility-bill PDFs to pull the <b>account name</b>, <b>account number</b>, and <b>billing postal code</b>. Everything runs in your browser — no files are uploaded anywhere.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept="application/pdf" multiple>
+    <div>Drop PDFs here or <strong>click to browse</strong></div>
+    <small>You can select several at once. Non-PDF files are ignored.</small>
+  </label>
+
+  <div class="bar" id="bar" hidden>
+    <span class="status" id="status"></span>
+    <span class="spacer"></span>
+    <button class="ghost" id="clear">Clear</button>
+    <button id="csv" disabled>Download CSV</button>
+  </div>
+
+  <table id="table" hidden>
+    <thead>
+      <tr>
+        <th style="width:22%">File</th>
+        <th style="width:28%">Account name</th>
+        <th style="width:20%">Account number</th>
+        <th style="width:16%">Postal code</th>
+        <th style="width:14%"></th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <p class="hint" id="hint" hidden>
+    Cells are editable — click any value to correct it before downloading. The extraction is heuristic, so double-check unusual bills. Use <b>text</b> on a row to see exactly what was read from the PDF.
+  </p>
+</div>
+
+<dialog id="modal">
+  <header><strong id="modalTitle">Extracted text</strong><button class="ghost" onclick="modal.close()">Close</button></header>
+  <pre id="modalText"></pre>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const $ = id => document.getElementById(id);
+const rows = []; // { file, name, number, postal, text }
+
+// ---------- PDF -> lines ----------
+async function pdfToLines(arrayBuffer) {
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const allLines = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const items = content.items
+      .filter(i => i.str && i.str.trim())
+      .map(i => ({ str: i.str, x: i.transform[4], y: i.transform[5] }));
+    // Cluster into visual lines by y position (top -> bottom), then order by x.
+    items.sort((a, b) => (b.y - a.y) || (a.x - b.x));
+    let cur = null;
+    const lines = [];
+    for (const it of items) {
+      if (!cur || Math.abs(it.y - cur.y) > 4) { cur = { y: it.y, items: [it] }; lines.push(cur); }
+      else cur.items.push(it);
+    }
+    for (const l of lines) {
+      const s = l.items.sort((a, b) => a.x - b.x).map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
+      if (s) allLines.push(s);
+    }
+  }
+  return allLines;
+}
+
+// ---------- Heuristics ----------
+const POSTAL = /\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z]\s?\d[ABCEGHJ-NPRSTV-Z]\d\b/i;
+const POSTAL_G = new RegExp(POSTAL.source, 'gi');
+const STREET = /^\d{1,6}[A-Za-z]?\s+\D/;               // "4305 FAIRVIEW ST"
+const NAME_STOP = /account|service address|service location|billing|customer|premise|meter|statement|\bpage\b|www|p\.?o\.?\s*box|hydro|alectra|utilities|networks|corporation|withdrawal|balance|amount/i;
+
+function fmtPostal(p) {
+  const c = p.toUpperCase().replace(/\s+/g, '');
+  return c.length === 6 ? c.slice(0, 3) + ' ' + c.slice(3) : p.toUpperCase();
+}
+
+// Account number: digit run (7-15) closest to an "account number/no/#" label.
+function extractAccountNumber(text) {
+  const labelRe = /account\s+(?:number|no\.?|#)/gi;
+  const labels = [];
+  let m;
+  while ((m = labelRe.exec(text))) labels.push(m.index);
+
+  const cands = [];
+  const freq = {};
+  const numRe = /\b\d{7,15}\b/g;
+  while ((m = numRe.exec(text))) { cands.push({ num: m[0], idx: m.index }); freq[m[0]] = (freq[m[0]] || 0) + 1; }
+  if (!cands.length) return '';
+
+  if (!labels.length) { // no label: fall back to most frequent, then longest
+    cands.sort((a, b) => (freq[b.num] - freq[a.num]) || (b.num.length - a.num.length));
+    return cands[0].num;
+  }
+  let best = null, bestDist = Infinity;
+  for (const c of cands) {
+    let d = Infinity;
+    for (const li of labels) d = Math.min(d, Math.abs(c.idx - li));
+    if (d < bestDist || (d === bestDist && freq[c.num] > freq[best.num])) { bestDist = d; best = c; }
+  }
+  return best ? best.num : '';
+}
+
+// Name + billing postal: find a mailing block (street line followed by a postal line),
+// then read up to 3 uppercase name lines directly above the street.
+function extractNameAndPostal(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (STREET.test(lines[i]) && i + 1 < lines.length && POSTAL.test(lines[i + 1])) {
+      const postal = fmtPostal(lines[i + 1].match(POSTAL)[0]);
+      const names = [];
+      for (let j = i - 1; j >= 0 && names.length < 3; j--) {
+        const L = lines[j].trim();
+        if (!L || /^\d/.test(L) || NAME_STOP.test(L)) break;
+        const letters = (L.match(/[A-Za-z]/g) || []).length;
+        const uppers = (L.match(/[A-Z]/g) || []).length;
+        if (letters < 2 || uppers / letters < 0.6) break;
+        names.unshift(L);
+      }
+      return { name: names.join(' / '), postal };
+    }
+  }
+  // Fallback: any postal in the doc (last one), no name.
+  const all = lines.join('\n').match(POSTAL_G);
+  return { name: '', postal: all ? fmtPostal(all[all.length - 1]) : '' };
+}
+
+// ---------- UI ----------
+async function handleFiles(fileList) {
+  const files = [...fileList].filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
+  if (!files.length) return;
+  $('bar').hidden = false; $('table').hidden = false; $('hint').hidden = false;
+  for (const file of files) {
+    setStatus(`Reading ${file.name}…`);
+    try {
+      const buf = await file.arrayBuffer();
+      const lines = await pdfToLines(buf);
+      const text = lines.join('\n');
+      const { name, postal } = extractNameAndPostal(lines);
+      rows.push({ file: file.name, name, number: extractAccountNumber(text), postal, text });
+    } catch (e) {
+      rows.push({ file: file.name, name: '', number: '', postal: '', text: 'ERROR: ' + e.message });
+    }
+    render();
+  }
+  setStatus(`${rows.length} bill${rows.length === 1 ? '' : 's'} processed.`);
+  $('csv').disabled = rows.length === 0;
+}
+
+function cell(val, key, idx) {
+  const empty = !val;
+  return `<td class="editable${empty ? ' empty' : ''}" contenteditable data-idx="${idx}" data-key="${key}">${esc(empty ? 'not found' : val)}</td>`;
+}
+function render() {
+  $('tbody').innerHTML = rows.map((r, i) => `
+    <tr>
+      <td class="file">${esc(r.file)}</td>
+      ${cell(r.name, 'name', i)}
+      ${cell(r.number, 'number', i)}
+      ${cell(r.postal, 'postal', i)}
+      <td class="row-actions"><button data-text="${i}">text</button><button data-del="${i}">remove</button></td>
+    </tr>`).join('');
+}
+
+$('tbody').addEventListener('input', e => {
+  const td = e.target.closest('td.editable');
+  if (!td) return;
+  const v = td.textContent.trim();
+  rows[+td.dataset.idx][td.dataset.key] = (v === 'not found') ? '' : v;
+});
+$('tbody').addEventListener('focus', e => {
+  const td = e.target.closest('td.empty');
+  if (td) { td.textContent = ''; td.classList.remove('empty'); }
+}, true);
+$('tbody').addEventListener('click', e => {
+  const t = e.target.closest('button[data-text]'); const d = e.target.closest('button[data-del]');
+  if (t) { const r = rows[+t.dataset.text]; $('modalTitle').textContent = r.file; $('modalText').textContent = r.text; modal.showModal(); }
+  if (d) { rows.splice(+d.dataset.del, 1); render(); setStatus(`${rows.length} bill${rows.length === 1 ? '' : 's'} processed.`); $('csv').disabled = !rows.length; }
+});
+
+function toCSV() {
+  const head = ['File', 'Account name', 'Account number', 'Postal code'];
+  const q = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
+  const lines = [head.map(q).join(',')];
+  for (const r of rows) lines.push([r.file, r.name, r.number, r.postal].map(q).join(','));
+  return lines.join('\r\n');
+}
+$('csv').addEventListener('click', () => {
+  const blob = new Blob(['﻿' + toCSV()], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'utility-bills.csv'; a.click();
+  URL.revokeObjectURL(a.href);
+});
+$('clear').addEventListener('click', () => { rows.length = 0; render(); $('csv').disabled = true; setStatus(''); $('file').value = ''; });
+
+// drag & drop
+const drop = $('drop');
+$('file').addEventListener('change', e => handleFiles(e.target.files));
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hot'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hot'); }));
+drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+
+function setStatus(s) { $('status').textContent = s; }
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+</script>
+</body>
+</html>
