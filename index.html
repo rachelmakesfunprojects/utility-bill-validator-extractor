@@ -33,12 +33,17 @@
   h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.02em; }
   .sub { color: var(--muted); margin: 0 0 24px; }
   .drop {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 280px; width: 100%;
     border: 2px dashed var(--border); border-radius: 14px; background: var(--panel);
-    padding: 40px 24px; text-align: center; cursor: pointer; transition: .15s;
+    padding: 48px 24px; text-align: center; cursor: pointer;
+    transition: border-color .15s, background .15s;
   }
   .drop:hover, .drop.hot { border-color: var(--accent); background: var(--panel-2); }
+  .drop.hot { border-style: solid; }
+  .drop-title { font-size: 17px; }
   .drop strong { color: var(--accent); }
-  .drop small { color: var(--muted); display: block; margin-top: 8px; }
+  .drop small { color: var(--muted); display: block; margin-top: 10px; max-width: 42ch; }
   input[type=file] { display: none; }
   .bar { display: flex; gap: 10px; align-items: center; margin: 20px 0 12px; flex-wrap: wrap; }
   .bar .spacer { flex: 1; }
@@ -78,7 +83,7 @@
 
   <label class="drop" id="drop">
     <input type="file" id="file" accept="application/pdf" multiple>
-    <div>Drop PDFs here or <strong>click to browse</strong></div>
+    <div class="drop-title">Drop PDFs here or <strong>click to browse</strong></div>
     <small>You can select several at once. Non-PDF files are ignored.</small>
   </label>
 
