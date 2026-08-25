@@ -97,10 +97,11 @@
   <table id="table" hidden>
     <thead>
       <tr>
-        <th style="width:22%">File</th>
-        <th style="width:28%">Account name</th>
-        <th style="width:20%">Account number</th>
-        <th style="width:16%">Postal code</th>
+        <th style="width:18%">File</th>
+        <th style="width:16%">Utility</th>
+        <th style="width:22%">Account name</th>
+        <th style="width:16%">Account number</th>
+        <th style="width:14%">Postal code</th>
         <th style="width:14%"></th>
       </tr>
     </thead>
@@ -123,43 +124,100 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = id => document.getElementById(id);
-const rows = []; // { file, name, number, postal, text }
+const rows = []; // { file, utility, name, number, postal, text }
 
-// ---------- PDF -> lines ----------
-async function pdfToLines(arrayBuffer) {
+// ---------- PDF -> positioned text segments ----------
+// Rows are clustered by y, then split by the horizontal gap between glyphs.
+// Three regimes, measured against glyph height so they hold at any font size:
+//   gap <= 0.12h  kerning artifact  -> join tight ("ST"+"ORAGE" = "STORAGE")
+//   gap <= 2.0h   ordinary space    -> join with " "
+//   gap >  2.0h   column boundary   -> start a new segment
+// Without the column split, a wide bill welds its right-hand legal column onto
+// the mailing address block and the account name becomes unreadable.
+async function pdfToSegments(arrayBuffer) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const allLines = [];
+  const segments = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
     const items = content.items
       .filter(i => i.str && i.str.trim())
-      .map(i => ({ str: i.str, x: i.transform[4], y: i.transform[5] }));
-    // Cluster into visual lines by y position (top -> bottom), then order by x.
+      .map(i => ({ str: i.str, x: i.transform[4], y: i.transform[5], w: i.width, h: Math.abs(i.transform[3]) || 9 }));
     items.sort((a, b) => (b.y - a.y) || (a.x - b.x));
     let cur = null;
-    const lines = [];
+    const rows = [];
     for (const it of items) {
-      if (!cur || Math.abs(it.y - cur.y) > 4) { cur = { y: it.y, items: [it] }; lines.push(cur); }
+      if (!cur || Math.abs(it.y - cur.y) > 4) { cur = { y: it.y, items: [it] }; rows.push(cur); }
       else cur.items.push(it);
     }
-    for (const l of lines) {
-      const s = l.items.sort((a, b) => a.x - b.x).map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
-      if (s) allLines.push(s);
+    for (const row of rows) {
+      let seg = null, prevEnd = null;
+      for (const it of row.items.sort((a, b) => a.x - b.x)) {
+        const gap = prevEnd === null ? null : it.x - prevEnd;
+        if (seg === null || gap > it.h * 2.0) {
+          if (seg) segments.push(seg);
+          seg = { text: it.str, x: it.x, y: row.y };
+        } else if (gap > it.h * 0.12) {
+          seg.text += ' ' + it.str;
+        } else {
+          seg.text += it.str;
+        }
+        prevEnd = it.x + it.w;
+      }
+      if (seg) { seg.text = seg.text.replace(/\s+/g, ' ').trim(); if (seg.text) segments.push(seg); }
     }
   }
-  return allLines;
+  return segments;
 }
 
 // ---------- Heuristics ----------
 const POSTAL = /\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z]\s?\d[ABCEGHJ-NPRSTV-Z]\d\b/i;
 const POSTAL_G = new RegExp(POSTAL.source, 'gi');
 const STREET = /^\d{1,6}[A-Za-z]?\s+\D/;               // "4305 FAIRVIEW ST"
+const COL_TOL = 14;   // pt; how far segments may drift and still count as one column
 const NAME_STOP = /account|service address|service location|billing|customer|premise|meter|statement|\bpage\b|www|p\.?o\.?\s*box|hydro|alectra|utilities|networks|corporation|withdrawal|balance|amount/i;
 
 function fmtPostal(p) {
   const c = p.toUpperCase().replace(/\s+/g, '');
   return c.length === 6 ? c.slice(0, 3) + ' ' + c.slice(3) : p.toUpperCase();
+}
+
+// Utility: match compact signatures against text with all non-alphanumerics stripped.
+// pdf.js injects kerning spaces mid-word ("T ORONT O HYDRO"), so we flatten before
+// matching and score by hit count to break ties (a Toronto address on a Hydro One
+// bill would otherwise glue into a false "torontohydro").
+const UTILITIES = [
+  ["Toronto Hydro",            [/torontohydro/g]],
+  ["Hydro One",                [/hydroone/g]],
+  ["Alectra Utilities",        [/alectra/g]],
+  ["Elexicon Energy",          [/elexicon/g]],
+  ["Oakville Hydro",           [/oakvillehydro/g]],
+  ["Burlington Hydro",         [/burlingtonhydro/g]],
+  ["Milton Hydro",             [/miltonhydro/g]],
+  ["Halton Hills Hydro",       [/haltonhillshydro/g]],
+  ["Enbridge Gas",             [/enbridgegas/g, /enbridge/g]],
+  ["Hydro Ottawa",             [/hydroottawa/g]],
+  ["London Hydro",             [/londonhydro/g]],
+  ["Enova Power",              [/enovapower/g]],
+  ["Niagara Peninsula Energy", [/npei/g, /niagarapeninsulaenergy/g]],
+  ["EPCOR",                    [/epcor/g]],
+  ["Entegrus",                 [/entegrus/g]],
+  ["Festival Hydro",           [/festivalhydro/g]],
+  ["Newmarket-Tay Power",      [/newmarkettay/g]],
+  ["Greater Sudbury Hydro",    [/greatersudburyhydro/g]],
+  ["Synergy North",            [/synergynorth/g]],
+  ["Waterloo North Hydro",     [/waterloonorthhydro/g]],
+];
+
+function extractUtility(text) {
+  const flat = text.toLowerCase().replace(/[^a-z0-9]/g, "");
+  let best = "", bestScore = 0;
+  for (const [name, pats] of UTILITIES) {
+    let score = 0;
+    for (const pat of pats) score += (flat.match(pat) || []).length;
+    if (score > bestScore) { bestScore = score; best = name; }
+  }
+  return best;
 }
 
 // Account number: digit run (7-15) closest to an "account number/no/#" label.
@@ -188,26 +246,33 @@ function extractAccountNumber(text) {
   return best ? best.num : '';
 }
 
-// Name + billing postal: find a mailing block (street line followed by a postal line),
-// then read up to 3 uppercase name lines directly above the street.
-function extractNameAndPostal(lines) {
-  for (let i = 0; i < lines.length; i++) {
-    if (STREET.test(lines[i]) && i + 1 < lines.length && POSTAL.test(lines[i + 1])) {
-      const postal = fmtPostal(lines[i + 1].match(POSTAL)[0]);
-      const names = [];
-      for (let j = i - 1; j >= 0 && names.length < 3; j--) {
-        const L = lines[j].trim();
-        if (!L || /^\d/.test(L) || NAME_STOP.test(L)) break;
-        const letters = (L.match(/[A-Za-z]/g) || []).length;
-        const uppers = (L.match(/[A-Z]/g) || []).length;
-        if (letters < 2 || uppers / letters < 0.6) break;
-        names.unshift(L);
-      }
-      return { name: names.join(' / '), postal };
+// Name + billing postal: find a mailing block (street segment followed by a postal
+// segment in the SAME column), then read up to 3 uppercase name lines above it.
+// Restricting to one column matters: on a wide bill the segments immediately
+// before and after the street line belong to an unrelated right-hand column.
+function extractNameAndPostal(segments) {
+  for (let i = 0; i < segments.length; i++) {
+    if (!STREET.test(segments[i].text)) continue;
+    const col = segments.filter(s => Math.abs(s.x - segments[i].x) <= COL_TOL);
+    const k = col.indexOf(segments[i]);
+    if (k < 0 || k + 1 >= col.length || !POSTAL.test(col[k + 1].text)) continue;
+
+    const postal = fmtPostal(col[k + 1].text.match(POSTAL)[0]);
+    const names = [];
+    for (let j = k - 1; j >= 0 && names.length < 3; j--) {
+      const L = col[j].text.trim();
+      if (!L || /^\d/.test(L) || NAME_STOP.test(L)) break;
+      const letters = (L.match(/[A-Za-z]/g) || []).length;
+      const uppers = (L.match(/[A-Z]/g) || []).length;
+      if (letters < 2 || uppers / letters < 0.6) break;
+      names.unshift(L);
     }
+    // Keep the whole addressee block: the top line is the account holder, any
+    // lines below it are the parent company or a care-of line.
+    return { name: names.join(' / '), postal };
   }
   // Fallback: any postal in the doc (last one), no name.
-  const all = lines.join('\n').match(POSTAL_G);
+  const all = segments.map(s => s.text).join('\n').match(POSTAL_G);
   return { name: '', postal: all ? fmtPostal(all[all.length - 1]) : '' };
 }
 
@@ -220,12 +285,12 @@ async function handleFiles(fileList) {
     setStatus(`Reading ${file.name}…`);
     try {
       const buf = await file.arrayBuffer();
-      const lines = await pdfToLines(buf);
-      const text = lines.join('\n');
-      const { name, postal } = extractNameAndPostal(lines);
-      rows.push({ file: file.name, name, number: extractAccountNumber(text), postal, text });
+      const segments = await pdfToSegments(buf);
+      const text = segments.map(s => s.text).join('\n');
+      const { name, postal } = extractNameAndPostal(segments);
+      rows.push({ file: file.name, utility: extractUtility(text), name, number: extractAccountNumber(text), postal, text });
     } catch (e) {
-      rows.push({ file: file.name, name: '', number: '', postal: '', text: 'ERROR: ' + e.message });
+      rows.push({ file: file.name, utility: '', name: '', number: '', postal: '', text: 'ERROR: ' + e.message });
     }
     render();
   }
@@ -241,6 +306,7 @@ function render() {
   $('tbody').innerHTML = rows.map((r, i) => `
     <tr>
       <td class="file">${esc(r.file)}</td>
+      ${cell(r.utility, 'utility', i)}
       ${cell(r.name, 'name', i)}
       ${cell(r.number, 'number', i)}
       ${cell(r.postal, 'postal', i)}
@@ -265,10 +331,10 @@ $('tbody').addEventListener('click', e => {
 });
 
 function toCSV() {
-  const head = ['File', 'Account name', 'Account number', 'Postal code'];
+  const head = ['File', 'Utility', 'Account name', 'Account number', 'Postal code'];
   const q = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
   const lines = [head.map(q).join(',')];
-  for (const r of rows) lines.push([r.file, r.name, r.number, r.postal].map(q).join(','));
+  for (const r of rows) lines.push([r.file, r.utility, r.name, r.number, r.postal].map(q).join(','));
   return lines.join('\r\n');
 }
 $('csv').addEventListener('click', () => {
