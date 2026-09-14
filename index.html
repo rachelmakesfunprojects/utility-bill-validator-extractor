@@ -97,12 +97,13 @@
   <table id="table" hidden>
     <thead>
       <tr>
-        <th style="width:18%">File</th>
-        <th style="width:16%">Utility</th>
-        <th style="width:22%">Account name</th>
-        <th style="width:16%">Account number</th>
-        <th style="width:14%">Postal code</th>
-        <th style="width:14%"></th>
+        <th style="width:16%">File</th>
+        <th style="width:13%">Utility</th>
+        <th style="width:21%">Account name</th>
+        <th style="width:14%">Account number</th>
+        <th style="width:14%">Premise ID / POD</th>
+        <th style="width:10%">Postal code</th>
+        <th style="width:12%"></th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -124,7 +125,7 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = id => document.getElementById(id);
-const rows = []; // { file, utility, name, number, postal, text }
+const rows = []; // { file, utility, name, number, premise, postal, text }
 
 // ---------- PDF -> positioned text segments ----------
 // Rows are clustered by y, then split by the horizontal gap between glyphs.
@@ -156,7 +157,7 @@ async function pdfToSegments(arrayBuffer) {
         const gap = prevEnd === null ? null : it.x - prevEnd;
         if (seg === null || gap > it.h * 2.0) {
           if (seg) segments.push(seg);
-          seg = { text: it.str, x: it.x, y: row.y };
+          seg = { text: it.str, x: it.x, y: row.y, page: p };
         } else if (gap > it.h * 0.12) {
           seg.text += ' ' + it.str;
         } else {
@@ -218,6 +219,27 @@ function extractUtility(text) {
     if (score > bestScore) { bestScore = score; best = name; }
   }
   return best;
+}
+
+// Premise ID / Point of Delivery: each utility names it differently. The value is
+// either on the label's own segment ("Premise #: 4113200744") or directly below
+// the label in the same column (Toronto Hydro's "Premises Number" header). The
+// label must be followed by a number, so prose like "a customer's premise" is ignored.
+const PREMISE_LABEL = /premises?\s*(?:number|no\.?|#|id)|point\s*of\s*delivery|service\s*point\s*(?:id|number|no\.?|#)?/i;
+const PREMISE_INLINE = /(?:premises?\s*(?:number|no\.?|#|id)|point\s*of\s*delivery|service\s*point\s*(?:id|number|no\.?|#)?)\s*[:#]?\s*(\d{5,15})\b/i;
+const PREMISE_VALUE = /^\d{5,15}$/;
+
+function extractPremise(segments) {
+  for (const s of segments) {
+    if (!PREMISE_LABEL.test(s.text)) continue;
+    const inline = s.text.match(PREMISE_INLINE);
+    if (inline) return inline[1];
+    const below = segments
+      .filter(t => t.page === s.page && Math.abs(t.x - s.x) <= COL_TOL && s.y - t.y > 3 && s.y - t.y < 20)
+      .sort((a, b) => b.y - a.y)[0];
+    if (below && PREMISE_VALUE.test(below.text)) return below.text;
+  }
+  return '';
 }
 
 // Account number: digit run (7-15) closest to an "account number/no/#" label.
@@ -288,9 +310,9 @@ async function handleFiles(fileList) {
       const segments = await pdfToSegments(buf);
       const text = segments.map(s => s.text).join('\n');
       const { name, postal } = extractNameAndPostal(segments);
-      rows.push({ file: file.name, utility: extractUtility(text), name, number: extractAccountNumber(text), postal, text });
+      rows.push({ file: file.name, utility: extractUtility(text), name, number: extractAccountNumber(text), premise: extractPremise(segments), postal, text });
     } catch (e) {
-      rows.push({ file: file.name, utility: '', name: '', number: '', postal: '', text: 'ERROR: ' + e.message });
+      rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', postal: '', text: 'ERROR: ' + e.message });
     }
     render();
   }
@@ -309,6 +331,7 @@ function render() {
       ${cell(r.utility, 'utility', i)}
       ${cell(r.name, 'name', i)}
       ${cell(r.number, 'number', i)}
+      ${cell(r.premise, 'premise', i)}
       ${cell(r.postal, 'postal', i)}
       <td class="row-actions"><button data-text="${i}">text</button><button data-del="${i}">remove</button></td>
     </tr>`).join('');
@@ -331,10 +354,10 @@ $('tbody').addEventListener('click', e => {
 });
 
 function toCSV() {
-  const head = ['File', 'Utility', 'Account name', 'Account number', 'Postal code'];
+  const head = ['File', 'Utility', 'Account name', 'Account number', 'Premise ID / POD', 'Postal code'];
   const q = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
   const lines = [head.map(q).join(',')];
-  for (const r of rows) lines.push([r.file, r.utility, r.name, r.number, r.postal].map(q).join(','));
+  for (const r of rows) lines.push([r.file, r.utility, r.name, r.number, r.premise, r.postal].map(q).join(','));
   return lines.join('\r\n');
 }
 $('csv').addEventListener('click', () => {
