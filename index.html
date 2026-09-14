@@ -29,7 +29,9 @@
     font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     padding: 32px 20px 80px;
   }
-  .wrap { max-width: 1040px; margin: 0 auto; }
+  .wrap { max-width: 1440px; margin: 0 auto; }
+  .table-scroll { overflow-x: auto; }
+  .table-scroll table { min-width: 1100px; }
   h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.02em; }
   .sub { color: var(--muted); margin: 0 0 24px; }
   .drop {
@@ -81,7 +83,7 @@
 <body>
 <div class="wrap">
   <h1>Utility Bill Extractor</h1>
-  <p class="sub">Drop utility-bill PDFs to pull the <b>account name</b>, <b>account number</b>, and <b>billing postal code</b>. Everything runs in your browser — no files are uploaded anywhere.</p>
+  <p class="sub">Drop utility-bill PDFs to pull the <b>account name</b>, <b>account number</b>, <b>service address</b>, and <b>billing postal code</b>. Everything runs in your browser — no files are uploaded anywhere.</p>
 
   <label class="drop" id="drop">
     <input type="file" id="file" accept="application/pdf" multiple>
@@ -96,24 +98,29 @@
     <button id="csv" disabled>Download CSV</button>
   </div>
 
+  <div class="table-scroll">
   <table id="table" hidden>
     <thead>
       <tr>
-        <th style="width:16%">File</th>
-        <th style="width:13%">Utility</th>
-        <th style="width:21%">Account name</th>
-        <th style="width:14%">Account number</th>
-        <th style="width:14%">Premise ID / POD</th>
-        <th style="width:10%">Postal code</th>
-        <th style="width:12%"></th>
+        <th style="width:11%">File</th>
+        <th style="width:9%">Utility</th>
+        <th style="width:15%">Account name</th>
+        <th style="width:10%">Account number</th>
+        <th style="width:9%">Premise ID / POD</th>
+        <th style="width:8%">Billing address postal code</th>
+        <th style="width:14%">Service address</th>
+        <th style="width:8%">City</th>
+        <th style="width:8%">Service address postal code</th>
+        <th style="width:8%"></th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
   </table>
+  </div>
 
   <p class="hint" id="hint" hidden>
     Cells are editable — click any value to correct it before downloading. The extraction is heuristic, so double-check unusual bills. Use <b>text</b> on a row to see exactly what was read from the PDF.
-    <span class="unsure-key">Highlighted</span> values came from a scan where look-alike letters were changed to digits (for example S → 5). Hover to see what the scan read, and check them against the bill. Editing a value clears its highlight.
+    <span class="unsure-key">Highlighted</span> values need checking against the bill: either look-alike letters from a scan were changed to digits (for example S → 5), or the city wasn't printed and was filled in from the utility. Hover to see why. Editing a value clears its highlight.
   </p>
 </div>
 
@@ -129,7 +136,7 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = id => document.getElementById(id);
-const rows = []; // { file, utility, name, number, premise, postal, text }
+const rows = []; // { file, utility, name, number, premise, serviceAddress, city, servicePostal, billingPostal, unsure, text }
 
 // ---------- PDF -> positioned text segments ----------
 // Rows are clustered by y, then split by the horizontal gap between glyphs.
@@ -408,6 +415,79 @@ function extractAccountNumber(text) {
   return cands.find(c => c.num === best.num && !c.n.repaired)?.n || best.n;
 }
 
+// ---------- Service address ----------
+// Bills print the service address three ways:
+//   inline after a label:  "Service Location: 37 JOHN ST MISSISSAUGA ON L5A 1Y5"
+//   label with the value in a column to its right, under a name line (Hydro One):
+//       "Service address:"   "STORAGEVAULT CANADA INC." / "11 BROWNING CRT"
+//   a section header per service (London Hydro): "101 VERONICA AVE UNIT 108 - 101 VERONICA AVE"
+// Many bills leave out the city or postal code; those fields stay blank.
+const SERVICE_LABEL = /service\s*(?:address|location)\s*:?\s*/i;
+const SECTION_HEADER = /^(\d{1,6}[A-Za-z]?\s+\D.*?)\s+[-–—]\s+(\d{1,6}[A-Za-z]?\s+\D.*)$/;
+const UNIT = /\b(?:UNIT|SUITE|STE|APT)\s*#?\s*[\w-]+/i;
+const STREET_SUFFIX = /\b(?:ST|STREET|RD|ROAD|AVE?|AVENUE|DR|DRIVE|CRT|CT|COURT|CRES|CRESCENT|BLVD|BOULEVARD|WAY|LANE|LN|PKWY|PARKWAY|HWY|HIGHWAY|CIR|CIRCLE|PL|PLACE|TERR?|TERRACE|TRL|TRAIL|SQ|SQUARE|GATE|LINE|SIDEROAD|SDRD|GROVE|GRV)\b\.?(?:\s+(?:N|S|E|W|NORTH|SOUTH|EAST|WEST)\b)?(?:\s+(?:UNIT|SUITE|STE|APT)\s*#?\s*[\w-]+)?/gi;
+const NO_SERVICE = { address: '', city: '', postal: '' };
+
+// Split "37 JOHN ST MISSISSAUGA ON L5A 1Y5" into address, city and postal code.
+// The city is whatever follows a comma, or else follows the last street type (ST, RD, AVE…).
+function parseServiceAddress(raw) {
+  let s = raw.replace(/\s+/g, ' ').trim().replace(/[,\s]+$/, '');
+  let postal = '';
+  const pm = s.match(new RegExp(POSTAL.source + '$', 'i'));
+  if (pm) { postal = fmtPostal(pm[0]); s = s.slice(0, pm.index).trim(); }
+  s = s.replace(/,?\s*\b(?:ON|ONT|ONTARIO)\.?$/i, '').replace(/[,\s]+$/, '');
+  let address = s, city = '';
+  const comma = s.lastIndexOf(',');
+  if (comma > 0 && !/\d/.test(s.slice(comma + 1))) {
+    address = s.slice(0, comma).trim();
+    city = s.slice(comma + 1).trim();
+  } else {
+    let last = null;
+    for (const m of s.matchAll(STREET_SUFFIX)) last = m;
+    if (last) {
+      address = s.slice(0, last.index + last[0].length).trim();
+      city = s.slice(last.index + last[0].length).trim();
+    }
+  }
+  if (!/^[A-Za-z][A-Za-z .'-]*$/.test(city)) city = '';
+  return { address, city, postal };
+}
+
+function extractServiceAddress(segments) {
+  for (const s of segments) {
+    const m = s.text.match(SERVICE_LABEL);
+    if (!m) continue;
+    const inline = s.text.slice(m.index + m[0].length).trim();
+    if (STREET.test(inline)) return parseServiceAddress(inline);
+    // Value in the column to the right of the label: skip any name line, take the
+    // street line, plus a city/postal line directly under it if there is one.
+    const right = segments
+      .filter(t => t.page === s.page && t.x > s.x + 20 && t.x < s.x + 300 && s.y - t.y > -4 && s.y - t.y < 40)
+      .sort((a, b) => (b.y - a.y) || (a.x - b.x));
+    const i = right.findIndex(t => STREET.test(t.text));
+    if (i < 0) continue;
+    const next = right[i + 1];
+    const tail = next && Math.abs(next.x - right[i].x) <= COL_TOL && (POSTAL.test(next.text) || /\b(?:ON|ONTARIO)\b/.test(next.text))
+      ? ', ' + next.text : '';
+    return parseServiceAddress(right[i].text + tail);
+  }
+  for (const s of segments) {
+    const h = s.text.match(SECTION_HEADER);
+    if (!h) continue;
+    // The left side names the service ("… UNIT 108"); the right side is the building.
+    const unit = h[1].match(UNIT);
+    const addr = unit && !UNIT.test(h[2]) ? h[2] + ' ' + unit[0] : h[2];
+    return parseServiceAddress(addr);
+  }
+  return NO_SERVICE;
+}
+
+// Utilities that serve a single city, used to fill in a city the bill doesn't print.
+const UTILITY_CITY = {
+  'Toronto Hydro': 'TORONTO', 'London Hydro': 'LONDON', 'Oakville Hydro': 'OAKVILLE',
+  'Burlington Hydro': 'BURLINGTON', 'Milton Hydro': 'MILTON',
+};
+
 // Name + billing postal: find a mailing block (street segment followed by a postal
 // segment in the SAME column), then read up to 3 uppercase name lines above it.
 // Restricting to one column matters: on a wide bill the segments immediately
@@ -450,21 +530,36 @@ async function handleFiles(fileList) {
       const segments = await pdfToSegments(buf, msg => setStatus(`${file.name}: ${msg}`));
       const text = segments.map(s => s.text).join('\n');
       const { name, postal } = extractNameAndPostal(segments);
-      const base = { file: file.name, utility: extractUtility(text), name, postal, text };
-      // `unsure` holds what the scan actually said for any value that needed repair.
-      const accountRow = (number, premise) => ({
-        ...base, number: number.value, premise: premise.value,
-        unsure: { number: number.repaired ? number.original : '', premise: premise.repaired ? premise.original : '' },
-      });
+      const utility = extractUtility(text);
+      const base = { file: file.name, utility, name, billingPostal: postal, text };
+      const repairedNote = n => n.repaired ? `the scan read "${n.original}" and look-alike letters were changed to digits` : '';
+      // `unsure` holds, per field, why a value should be checked against the bill.
+      const accountRow = (number, premise, service) => {
+        const inferCity = !service.city && UTILITY_CITY[utility];
+        return {
+          ...base, number: number.value, premise: premise.value,
+          serviceAddress: service.address, city: service.city || inferCity || '', servicePostal: service.postal,
+          unsure: {
+            number: repairedNote(number),
+            premise: repairedNote(premise),
+            city: inferCity ? `the bill doesn't print the city, so it was filled in from the utility (${utility} only serves one city)` : '',
+          },
+        };
+      };
       const accounts = extractServiceAccounts(segments);
       if (accounts.length > 1) {
-        // Premise is looked up on the account's own page so it isn't copied across accounts.
-        for (const a of accounts) rows.push(accountRow(a, extractPremise(segments.filter(s => s.page === a.page))));
+        // Premise and service address are looked up on the account's own page so they
+        // aren't copied across accounts.
+        for (const a of accounts) {
+          const own = segments.filter(s => s.page === a.page);
+          rows.push(accountRow(a, extractPremise(own), extractServiceAddress(own)));
+        }
       } else {
-        rows.push(accountRow(extractAccountNumber(text), extractPremise(segments)));
+        rows.push(accountRow(extractAccountNumber(text), extractPremise(segments), extractServiceAddress(segments)));
       }
     } catch (e) {
-      rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', postal: '', unsure: {}, text: 'ERROR: ' + e.message });
+      rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', serviceAddress: '', city: '',
+                  servicePostal: '', billingPostal: '', unsure: {}, text: 'ERROR: ' + e.message });
     }
     render();
   }
@@ -482,7 +577,7 @@ function cell(r, key, idx) {
   const val = r[key], empty = !val, unsure = r.unsure && r.unsure[key];
   const cls = 'editable' + (empty ? ' empty' : '') + (unsure ? ' unsure' : '');
   const title = unsure
-    ? ` title="${esc(`Check this against the bill: the scan read "${unsure}" and look-alike letters were changed to digits.`).replace(/"/g, '&quot;')}"`
+    ? ` title="${esc(`Check this against the bill: ${unsure}.`).replace(/"/g, '&quot;')}"`
     : '';
   return `<td class="${cls}"${title} contenteditable data-idx="${idx}" data-key="${key}">${esc(empty ? 'not found' : val)}</td>`;
 }
@@ -494,7 +589,10 @@ function render() {
       ${cell(r, 'name', i)}
       ${cell(r, 'number', i)}
       ${cell(r, 'premise', i)}
-      ${cell(r, 'postal', i)}
+      ${cell(r, 'billingPostal', i)}
+      ${cell(r, 'serviceAddress', i)}
+      ${cell(r, 'city', i)}
+      ${cell(r, 'servicePostal', i)}
       <td class="row-actions"><button data-text="${i}">text</button><button data-del="${i}">remove</button></td>
     </tr>`).join('');
 }
@@ -536,10 +634,13 @@ $('tbody').addEventListener('click', e => {
 });
 
 function toCSV() {
-  const head = ['File', 'Utility', 'Account name', 'Account number', 'Premise ID / POD', 'Postal code'];
+  const head = ['File', 'Utility', 'Account name', 'Account number', 'Premise ID / POD',
+                'Billing address postal code', 'Service address', 'City', 'Service address postal code'];
   const q = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
   const lines = [head.map(q).join(',')];
-  for (const r of rows) lines.push([r.file, r.utility, r.name, r.number, r.premise, r.postal].map(q).join(','));
+  for (const r of rows) {
+    lines.push([r.file, r.utility, r.name, r.number, r.premise, r.billingPostal, r.serviceAddress, r.city, r.servicePostal].map(q).join(','));
+  }
   return lines.join('\r\n');
 }
 $('csv').addEventListener('click', () => {
