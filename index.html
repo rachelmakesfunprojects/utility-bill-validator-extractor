@@ -121,6 +121,7 @@
 </dialog>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
@@ -135,12 +136,25 @@ const rows = []; // { file, utility, name, number, premise, postal, text }
 //   gap >  2.0h   column boundary   -> start a new segment
 // Without the column split, a wide bill welds its right-hand legal column onto
 // the mailing address block and the account name becomes unreadable.
-async function pdfToSegments(arrayBuffer) {
+async function pdfToSegments(arrayBuffer, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const segments = [];
+  const pages = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
-    const content = await page.getTextContent();
+    pages.push({ page, content: await page.getTextContent() });
+  }
+  // A scanned bill is just images with no text layer: OCR it instead. Decided for the
+  // whole document, so a text bill with a mostly-graphic page never goes through OCR.
+  const scanned = pages.every(({ content }) =>
+    content.items.reduce((n, i) => n + i.str.trim().length, 0) < OCR_MIN_CHARS);
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const { page, content } = pages[p - 1];
+    if (scanned) {
+      if (onProgress) onProgress(`reading scanned page ${p} of ${pdf.numPages}…`);
+      segments.push(...await ocrPage(page, p));
+      continue;
+    }
     const items = content.items
       .filter(i => i.str && i.str.trim())
       .map(i => ({ str: i.str, x: i.transform[4], y: i.transform[5], w: i.width, h: Math.abs(i.transform[3]) || 9 }));
@@ -169,6 +183,57 @@ async function pdfToSegments(arrayBuffer) {
     }
   }
   return segments;
+}
+
+// ---------- OCR for scanned pages ----------
+// Runs Tesseract locally in the browser; only its engine and English model are
+// downloaded from the CDN, the bill itself never leaves the page.
+const OCR_MIN_CHARS = 20;  // if no page has this much real text, the PDF is a scan
+const OCR_SCALE = 2;       // render at 2x so small print is legible to the OCR engine
+let ocrWorker = null;
+
+async function ocrPage(page, pageNo) {
+  const viewport = page.getViewport({ scale: OCR_SCALE });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  if (!ocrWorker) ocrWorker = Tesseract.createWorker('eng');
+  const { data } = await (await ocrWorker).recognize(canvas);
+  return ocrToSegments(data.lines, canvas.height, OCR_SCALE, pageNo);
+}
+
+// Convert OCR lines into the same segment shape the text layer produces.
+// Tesseract gives pixel boxes with y growing downward; PDF points have y growing
+// upward. Converting keeps the column and "value below label" rules working.
+function ocrToSegments(lines, pageHeightPx, scale, pageNo) {
+  const segments = [];
+  for (const line of lines) {
+    const h = line.bbox.y1 - line.bbox.y0;
+    const y = (pageHeightPx - line.bbox.y1) / scale;
+    let seg = null, prevEnd = null;
+    for (const w of line.words) {
+      const t = w.text.trim();
+      if (!t) continue;
+      if (seg === null || w.bbox.x0 - prevEnd > h * 2.0) {  // same column-gap rule as text PDFs
+        if (seg) segments.push(seg);
+        seg = { text: t, x: w.bbox.x0 / scale, y, page: pageNo };
+      } else {
+        seg.text += ' ' + t;
+      }
+      prevEnd = w.bbox.x1;
+    }
+    if (seg) segments.push(seg);
+  }
+  // Tesseract returns text block by block; re-order into rows, top to bottom.
+  segments.sort((a, b) => b.y - a.y);
+  const rows = [];
+  for (const s of segments) {
+    const row = rows[rows.length - 1];
+    if (row && Math.abs(row.y - s.y) <= 4) row.items.push(s);
+    else rows.push({ y: s.y, items: [s] });
+  }
+  return rows.flatMap(r => r.items.sort((a, b) => a.x - b.x));
 }
 
 // ---------- Heuristics ----------
@@ -242,6 +307,24 @@ function extractPremise(segments) {
   return '';
 }
 
+// Combined bills (e.g. London Hydro) list several service accounts under one billing
+// number, each with an inline "Account Number 266359-8310568". Returns each distinct
+// account with its page. Single-account bills repeat one number, so they return <= 1.
+// Accounts in a water-only section are skipped.
+const ACCOUNT_INLINE = /account\s+(?:number|no\.?|#)\s*:?\s*(\d[\d-]{4,24}\d)/i;
+
+function extractServiceAccounts(segments) {
+  const found = [];
+  for (const s of segments) {
+    const m = s.text.match(ACCOUNT_INLINE);
+    if (!m || found.some(a => a.number === m[1])) continue;
+    const row = segments.filter(t => t.page === s.page && Math.abs(t.y - s.y) < 6).map(t => t.text).join(' ');
+    if (/water|wastewater|sewer/i.test(row) && !/electric/i.test(row)) continue;
+    found.push({ number: m[1], page: s.page });
+  }
+  return found;
+}
+
 // Account number: digit run (7-15) closest to an "account number/no/#" label.
 function extractAccountNumber(text) {
   const labelRe = /account\s+(?:number|no\.?|#)/gi;
@@ -307,17 +390,30 @@ async function handleFiles(fileList) {
     setStatus(`Reading ${file.name}…`);
     try {
       const buf = await file.arrayBuffer();
-      const segments = await pdfToSegments(buf);
+      const segments = await pdfToSegments(buf, msg => setStatus(`${file.name}: ${msg}`));
       const text = segments.map(s => s.text).join('\n');
       const { name, postal } = extractNameAndPostal(segments);
-      rows.push({ file: file.name, utility: extractUtility(text), name, number: extractAccountNumber(text), premise: extractPremise(segments), postal, text });
+      const base = { file: file.name, utility: extractUtility(text), name, postal, text };
+      const accounts = extractServiceAccounts(segments);
+      if (accounts.length > 1) {
+        // Premise is looked up on the account's own page so it isn't copied across accounts.
+        for (const a of accounts) {
+          rows.push({ ...base, number: a.number, premise: extractPremise(segments.filter(s => s.page === a.page)) });
+        }
+      } else {
+        rows.push({ ...base, number: extractAccountNumber(text), premise: extractPremise(segments) });
+      }
     } catch (e) {
       rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', postal: '', text: 'ERROR: ' + e.message });
     }
     render();
   }
-  setStatus(`${rows.length} bill${rows.length === 1 ? '' : 's'} processed.`);
+  setStatus(countText());
   $('csv').disabled = rows.length === 0;
+}
+
+function countText() {
+  return `${rows.length} account${rows.length === 1 ? '' : 's'} extracted.`;
 }
 
 function cell(val, key, idx) {
@@ -350,7 +446,7 @@ $('tbody').addEventListener('focus', e => {
 $('tbody').addEventListener('click', e => {
   const t = e.target.closest('button[data-text]'); const d = e.target.closest('button[data-del]');
   if (t) { const r = rows[+t.dataset.text]; $('modalTitle').textContent = r.file; $('modalText').textContent = r.text; modal.showModal(); }
-  if (d) { rows.splice(+d.dataset.del, 1); render(); setStatus(`${rows.length} bill${rows.length === 1 ? '' : 's'} processed.`); $('csv').disabled = !rows.length; }
+  if (d) { rows.splice(+d.dataset.del, 1); render(); setStatus(countText()); $('csv').disabled = !rows.length; }
 });
 
 function toCSV() {
