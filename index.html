@@ -67,6 +67,8 @@
   td.editable:focus { background: rgba(79,140,255,.12); box-shadow: inset 0 0 0 1px var(--accent); border-radius: 4px; }
   td.file { color: var(--muted); font-size: 13px; max-width: 240px; word-break: break-word; }
   td.empty { color: var(--warn); font-style: italic; }
+  td.unsure { background: rgba(240,180,41,.16); box-shadow: inset 3px 0 0 var(--warn); cursor: help; }
+  .unsure-key { background: rgba(240,180,41,.16); box-shadow: inset 3px 0 0 var(--warn); padding: 0 4px 0 7px; border-radius: 2px; color: var(--text); }
   .row-actions button { background: transparent; color: var(--muted); border: 0; padding: 2px 6px; font-size: 12px; }
   .row-actions button:hover { color: var(--accent); }
   .hint { color: var(--muted); font-size: 13px; margin-top: 14px; }
@@ -111,6 +113,7 @@
 
   <p class="hint" id="hint" hidden>
     Cells are editable — click any value to correct it before downloading. The extraction is heuristic, so double-check unusual bills. Use <b>text</b> on a row to see exactly what was read from the PDF.
+    <span class="unsure-key">Highlighted</span> values came from a scan where look-alike letters were changed to digits (for example S → 5). Hover to see what the scan read, and check them against the bill. Editing a value clears its highlight.
   </p>
 </div>
 
@@ -286,46 +289,94 @@ function extractUtility(text) {
   return best;
 }
 
+// ---------- Numeric fields ----------
+// Account numbers and premise IDs are only ever digits and dashes. OCR sometimes
+// reads a digit as a look-alike ("S" for 5, "O" for 0, "l" for 1) or a dash as an
+// en dash, so these fields are matched loosely and then repaired. A token that is
+// mostly letters is a word, not a misread number, and anything that still isn't
+// digits and dashes after repair is rejected rather than shown.
+const LOOKALIKE_DIGITS = { O: '0', o: '0', Q: '0', D: '0', I: '1', l: '1', i: '1', '|': '1', '!': '1',
+                           Z: '2', z: '2', S: '5', s: '5', $: '5', G: '6', b: '6', B: '8', g: '9', q: '9' };
+const NUM_CHARS = '0-9OoQDIli|!ZzSs$GbBgq';
+const DASH_CHARS = '\\-\u2010-\u2015\u2212';
+const NUM_TOKEN = new RegExp(`^[${NUM_CHARS}][${NUM_CHARS}${DASH_CHARS}]*`);
+
+// Returns { value, original, repaired }. `repaired` is true when a look-alike letter
+// was changed to a digit, so the UI can highlight the value for checking. Normalizing
+// a dash doesn't count: it can't change which number it is.
+const NO_NUMBER = { value: '', original: '', repaired: false };
+
+function toDigits(token) {
+  const t = token.replace(/[\u2010-\u2015\u2212]/g, '-').replace(/^-+|-+$/g, '');
+  const body = t.replace(/-/g, '');
+  if (!body || (body.match(/\d/g) || []).length / body.length < 0.6) return NO_NUMBER;
+  const fixed = t.replace(/[^\d-]/g, c => LOOKALIKE_DIGITS[c] || '?');
+  if (!/^\d+(?:-\d+)*$/.test(fixed)) return NO_NUMBER;
+  return { value: fixed, original: t, repaired: fixed !== t };
+}
+
+// The repaired number that starts right after `labelRe` in `text`, or NO_NUMBER.
+function numberAfter(text, labelRe) {
+  const m = text.match(labelRe);
+  if (!m) return NO_NUMBER;
+  const tok = text.slice(m.index + m[0].length).match(NUM_TOKEN);
+  return tok ? toDigits(tok[0]) : NO_NUMBER;
+}
+
+const digitCount = n => n.value.replace(/-/g, '').length;
+
 // Premise ID / Point of Delivery: each utility names it differently. The value is
 // either on the label's own segment ("Premise #: 4113200744") or directly below
 // the label in the same column (Toronto Hydro's "Premises Number" header). The
 // label must be followed by a number, so prose like "a customer's premise" is ignored.
-const PREMISE_LABEL = /premises?\s*(?:number|no\.?|#|id)|point\s*of\s*delivery|service\s*point\s*(?:id|number|no\.?|#)?/i;
-const PREMISE_INLINE = /(?:premises?\s*(?:number|no\.?|#|id)|point\s*of\s*delivery|service\s*point\s*(?:id|number|no\.?|#)?)\s*[:#]?\s*(\d{5,15})\b/i;
-const PREMISE_VALUE = /^\d{5,15}$/;
+const PREMISE_LABEL = /(?:premises?\s*(?:number|no\.?|#|id)|point\s*of\s*delivery|service\s*point\s*(?:id|number|no\.?|#)?)\s*[:#]?\s*/i;
 
 function extractPremise(segments) {
+  const valid = n => digitCount(n) >= 5 && digitCount(n) <= 15;
   for (const s of segments) {
     if (!PREMISE_LABEL.test(s.text)) continue;
-    const inline = s.text.match(PREMISE_INLINE);
-    if (inline) return inline[1];
+    const inline = numberAfter(s.text, PREMISE_LABEL);
+    if (valid(inline)) return inline;
     const below = segments
       .filter(t => t.page === s.page && Math.abs(t.x - s.x) <= COL_TOL && s.y - t.y > 3 && s.y - t.y < 20)
       .sort((a, b) => b.y - a.y)[0];
-    if (below && PREMISE_VALUE.test(below.text)) return below.text;
+    if (!below) continue;
+    const tok = below.text.match(NUM_TOKEN);
+    const value = tok && tok[0].length === below.text.length ? toDigits(below.text) : NO_NUMBER;
+    if (valid(value)) return value;
   }
-  return '';
+  return NO_NUMBER;
 }
 
 // Combined bills (e.g. London Hydro) list several service accounts under one billing
 // number, each with an inline "Account Number 266359-8310568". Returns each distinct
 // account with its page. Single-account bills repeat one number, so they return <= 1.
 // Accounts in a water-only section are skipped.
-const ACCOUNT_INLINE = /account\s+(?:number|no\.?|#)\s*:?\s*(\d[\d-]{4,24}\d)/i;
+const ACCOUNT_LABEL = /account\s+(?:number|no\.?|#)\s*:?\s*/i;
 
 function extractServiceAccounts(segments) {
   const found = [];
   for (const s of segments) {
-    const m = s.text.match(ACCOUNT_INLINE);
-    if (!m || found.some(a => a.number === m[1])) continue;
+    const number = numberAfter(s.text, ACCOUNT_LABEL);
+    if (digitCount(number) < 5) continue;
+    const seen = found.find(a => a.value === number.value);
+    if (seen) {
+      // Read cleanly anywhere in the bill: no need to flag it.
+      if (!number.repaired) Object.assign(seen, number, { page: seen.page });
+      continue;
+    }
     const row = segments.filter(t => t.page === s.page && Math.abs(t.y - s.y) < 6).map(t => t.text).join(' ');
     if (/water|wastewater|sewer/i.test(row) && !/electric/i.test(row)) continue;
-    found.push({ number: m[1], page: s.page });
+    found.push({ ...number, page: s.page });
   }
   return found;
 }
 
 // Account number: digit run (7-15) closest to an "account number/no/#" label.
+// Runs are matched with look-alike letters allowed (see toDigits) and must stand
+// alone, not be part of a longer word or number.
+const ACCOUNT_RUN = new RegExp(`(?<![0-9A-Za-z|!$])[${NUM_CHARS}]{7,15}(?![0-9A-Za-z|!$])`, 'g');
+
 function extractAccountNumber(text) {
   const labelRe = /account\s+(?:number|no\.?|#)/gi;
   const labels = [];
@@ -334,21 +385,27 @@ function extractAccountNumber(text) {
 
   const cands = [];
   const freq = {};
-  const numRe = /\b\d{7,15}\b/g;
-  while ((m = numRe.exec(text))) { cands.push({ num: m[0], idx: m.index }); freq[m[0]] = (freq[m[0]] || 0) + 1; }
-  if (!cands.length) return '';
+  while ((m = ACCOUNT_RUN.exec(text))) {
+    const n = toDigits(m[0]);
+    if (!n.value) continue;
+    cands.push({ num: n.value, idx: m.index, n });
+    freq[n.value] = (freq[n.value] || 0) + 1;
+  }
+  if (!cands.length) return NO_NUMBER;
 
+  let best = null;
   if (!labels.length) { // no label: fall back to most frequent, then longest
-    cands.sort((a, b) => (freq[b.num] - freq[a.num]) || (b.num.length - a.num.length));
-    return cands[0].num;
+    best = [...cands].sort((a, b) => (freq[b.num] - freq[a.num]) || (b.num.length - a.num.length))[0];
+  } else {
+    let bestDist = Infinity;
+    for (const c of cands) {
+      let d = Infinity;
+      for (const li of labels) d = Math.min(d, Math.abs(c.idx - li));
+      if (d < bestDist || (d === bestDist && freq[c.num] > freq[best.num])) { bestDist = d; best = c; }
+    }
   }
-  let best = null, bestDist = Infinity;
-  for (const c of cands) {
-    let d = Infinity;
-    for (const li of labels) d = Math.min(d, Math.abs(c.idx - li));
-    if (d < bestDist || (d === bestDist && freq[c.num] > freq[best.num])) { bestDist = d; best = c; }
-  }
-  return best ? best.num : '';
+  // Only flag the number if every occurrence of it needed repair.
+  return cands.find(c => c.num === best.num && !c.n.repaired)?.n || best.n;
 }
 
 // Name + billing postal: find a mailing block (street segment followed by a postal
@@ -394,17 +451,20 @@ async function handleFiles(fileList) {
       const text = segments.map(s => s.text).join('\n');
       const { name, postal } = extractNameAndPostal(segments);
       const base = { file: file.name, utility: extractUtility(text), name, postal, text };
+      // `unsure` holds what the scan actually said for any value that needed repair.
+      const accountRow = (number, premise) => ({
+        ...base, number: number.value, premise: premise.value,
+        unsure: { number: number.repaired ? number.original : '', premise: premise.repaired ? premise.original : '' },
+      });
       const accounts = extractServiceAccounts(segments);
       if (accounts.length > 1) {
         // Premise is looked up on the account's own page so it isn't copied across accounts.
-        for (const a of accounts) {
-          rows.push({ ...base, number: a.number, premise: extractPremise(segments.filter(s => s.page === a.page)) });
-        }
+        for (const a of accounts) rows.push(accountRow(a, extractPremise(segments.filter(s => s.page === a.page))));
       } else {
-        rows.push({ ...base, number: extractAccountNumber(text), premise: extractPremise(segments) });
+        rows.push(accountRow(extractAccountNumber(text), extractPremise(segments)));
       }
     } catch (e) {
-      rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', postal: '', text: 'ERROR: ' + e.message });
+      rows.push({ file: file.name, utility: '', name: '', number: '', premise: '', postal: '', unsure: {}, text: 'ERROR: ' + e.message });
     }
     render();
   }
@@ -413,32 +473,58 @@ async function handleFiles(fileList) {
 }
 
 function countText() {
-  return `${rows.length} account${rows.length === 1 ? '' : 's'} extracted.`;
+  const unsure = rows.reduce((n, r) => n + Object.values(r.unsure || {}).filter(Boolean).length, 0);
+  return `${rows.length} account${rows.length === 1 ? '' : 's'} extracted.` +
+    (unsure ? ` ${unsure} highlighted value${unsure === 1 ? '' : 's'} to check.` : '');
 }
 
-function cell(val, key, idx) {
-  const empty = !val;
-  return `<td class="editable${empty ? ' empty' : ''}" contenteditable data-idx="${idx}" data-key="${key}">${esc(empty ? 'not found' : val)}</td>`;
+function cell(r, key, idx) {
+  const val = r[key], empty = !val, unsure = r.unsure && r.unsure[key];
+  const cls = 'editable' + (empty ? ' empty' : '') + (unsure ? ' unsure' : '');
+  const title = unsure
+    ? ` title="${esc(`Check this against the bill: the scan read "${unsure}" and look-alike letters were changed to digits.`).replace(/"/g, '&quot;')}"`
+    : '';
+  return `<td class="${cls}"${title} contenteditable data-idx="${idx}" data-key="${key}">${esc(empty ? 'not found' : val)}</td>`;
 }
 function render() {
   $('tbody').innerHTML = rows.map((r, i) => `
     <tr>
       <td class="file">${esc(r.file)}</td>
-      ${cell(r.utility, 'utility', i)}
-      ${cell(r.name, 'name', i)}
-      ${cell(r.number, 'number', i)}
-      ${cell(r.premise, 'premise', i)}
-      ${cell(r.postal, 'postal', i)}
+      ${cell(r, 'utility', i)}
+      ${cell(r, 'name', i)}
+      ${cell(r, 'number', i)}
+      ${cell(r, 'premise', i)}
+      ${cell(r, 'postal', i)}
       <td class="row-actions"><button data-text="${i}">text</button><button data-del="${i}">remove</button></td>
     </tr>`).join('');
 }
 
+// Account number and premise cells only accept digits and dashes, including when edited.
+const NUMERIC_KEYS = new Set(['number', 'premise']);
+$('tbody').addEventListener('beforeinput', e => {
+  const td = e.target.closest('td.editable');
+  if (td && NUMERIC_KEYS.has(td.dataset.key) && e.data && /[^\d-]/.test(e.data)) e.preventDefault();
+});
 $('tbody').addEventListener('input', e => {
   const td = e.target.closest('td.editable');
   if (!td) return;
-  const v = td.textContent.trim();
-  rows[+td.dataset.idx][td.dataset.key] = (v === 'not found') ? '' : v;
+  let v = td.textContent.trim();
+  if (v === 'not found') v = '';
+  if (NUMERIC_KEYS.has(td.dataset.key)) v = v.replace(/[^\d-]/g, '');
+  const row = rows[+td.dataset.idx];
+  row[td.dataset.key] = v;
+  // Editing a highlighted value counts as checking it.
+  if (row.unsure && row.unsure[td.dataset.key]) {
+    row.unsure[td.dataset.key] = '';
+    td.classList.remove('unsure');
+    td.removeAttribute('title');
+    setStatus(countText());
+  }
 });
+$('tbody').addEventListener('blur', e => {
+  const td = e.target.closest('td.editable');
+  if (td && NUMERIC_KEYS.has(td.dataset.key)) td.textContent = rows[+td.dataset.idx][td.dataset.key];
+}, true);
 $('tbody').addEventListener('focus', e => {
   const td = e.target.closest('td.empty');
   if (td) { td.textContent = ''; td.classList.remove('empty'); }
