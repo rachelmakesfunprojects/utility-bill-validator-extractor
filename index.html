@@ -120,7 +120,7 @@
 
   <p class="hint" id="hint" hidden>
     Cells are editable — click any value to correct it before downloading. The extraction is heuristic, so double-check unusual bills. Use <b>text</b> on a row to see exactly what was read from the PDF.
-    <span class="unsure-key">Highlighted</span> values need checking against the bill: either look-alike letters from a scan were changed to digits (for example S → 5), or the city wasn't printed and was filled in from the utility. Hover to see why. Editing a value clears its highlight.
+    <span class="unsure-key">Highlighted</span> values need checking against the bill: look-alike letters from a scan were changed to digits (for example S → 5), the city wasn't printed and was filled in from the utility, or the billing postal code had to be guessed. Hover to see why. Editing a value clears its highlight.
   </p>
 </div>
 
@@ -249,7 +249,9 @@ function ocrToSegments(lines, pageHeightPx, scale, pageNo) {
 // ---------- Heuristics ----------
 const POSTAL = /\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z]\s?\d[ABCEGHJ-NPRSTV-Z]\d\b/i;
 const POSTAL_G = new RegExp(POSTAL.source, 'gi');
-const STREET = /^\d{1,6}[A-Za-z]?\s+\D/;               // "4305 FAIRVIEW ST"
+const STREET = /^(?:\d{1,6}[A-Za-z]?-)?\d{1,6}[A-Za-z]?\s+\D/;   // "4305 FAIRVIEW ST", or suite first: "100-699 BALLIOL ST"
+// Numbered companies ("1001116790 LTD O/A …") are names even though they start with digits.
+const NUMBERED_COMPANY = /^\d{6,10}\s+(?:ONTARIO\s+|CANADA\s+)?(?:LTD|LIMITED|INC|CORP|CORPORATION)\b/i;
 const COL_TOL = 14;   // pt; how far segments may drift and still count as one column
 const NAME_STOP = /account|service address|service location|billing|customer|premise|meter|statement|\bpage\b|www|p\.?o\.?\s*box|hydro|alectra|utilities|networks|corporation|withdrawal|balance|amount/i;
 
@@ -503,7 +505,7 @@ function extractNameAndPostal(segments) {
     const names = [];
     for (let j = k - 1; j >= 0 && names.length < 3; j--) {
       const L = col[j].text.trim();
-      if (!L || /^\d/.test(L) || NAME_STOP.test(L)) break;
+      if (!L || (/^\d/.test(L) && !NUMBERED_COMPANY.test(L)) || NAME_STOP.test(L)) break;
       const letters = (L.match(/[A-Za-z]/g) || []).length;
       const uppers = (L.match(/[A-Z]/g) || []).length;
       if (letters < 2 || uppers / letters < 0.6) break;
@@ -513,9 +515,10 @@ function extractNameAndPostal(segments) {
     // lines below it are the parent company or a care-of line.
     return { name: names.join(' / '), postal };
   }
-  // Fallback: any postal in the doc (last one), no name.
+  // Fallback: any postal in the doc (last one), no name. This can be the utility's own
+  // address, so it's marked as guessed and highlighted for checking.
   const all = segments.map(s => s.text).join('\n').match(POSTAL_G);
-  return { name: '', postal: all ? fmtPostal(all[all.length - 1]) : '' };
+  return { name: '', postal: all ? fmtPostal(all[all.length - 1]) : '', guessed: !!all };
 }
 
 // ---------- UI ----------
@@ -529,7 +532,7 @@ async function handleFiles(fileList) {
       const buf = await file.arrayBuffer();
       const segments = await pdfToSegments(buf, msg => setStatus(`${file.name}: ${msg}`));
       const text = segments.map(s => s.text).join('\n');
-      const { name, postal } = extractNameAndPostal(segments);
+      const { name, postal, guessed } = extractNameAndPostal(segments);
       const utility = extractUtility(text);
       const base = { file: file.name, utility, name, billingPostal: postal, text };
       const repairedNote = n => n.repaired ? `the scan read "${n.original}" and look-alike letters were changed to digits` : '';
@@ -543,6 +546,7 @@ async function handleFiles(fileList) {
             number: repairedNote(number),
             premise: repairedNote(premise),
             city: inferCity ? `the bill doesn't print the city, so it was filled in from the utility (${utility} only serves one city)` : '',
+            billingPostal: guessed ? `no mailing address block was found, so this is the last postal code on the bill and may be the utility's own address` : '',
           },
         };
       };
