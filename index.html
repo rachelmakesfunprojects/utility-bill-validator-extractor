@@ -249,7 +249,11 @@ function ocrToSegments(lines, pageHeightPx, scale, pageNo) {
 // ---------- Heuristics ----------
 const POSTAL = /\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z]\s?\d[ABCEGHJ-NPRSTV-Z]\d\b/i;
 const POSTAL_G = new RegExp(POSTAL.source, 'gi');
-const STREET = /^(?:\d{1,6}[A-Za-z]?-)?\d{1,6}[A-Za-z]?\s+\D/;   // "4305 FAIRVIEW ST", or suite first: "100-699 BALLIOL ST"
+// "4305 FAIRVIEW ST", or a unit first: "100-699 BALLIOL ST", "1TO2-15 Millwood Cres" (units 1 to 2)
+const STREET = /^(?:\d[\dA-Za-z]{0,7}-)?\d{1,6}[A-Za-z]?\s+\D/;
+// Lines that can sit between the street and the city/postal line of a mailing address.
+const ADDRESS_EXTRA = /^(?:(?:SUITE|STE|UNIT|APT|FLOOR|FLR|BLDG|BUILDING|RR)\b|P\.?\s*O\.?\s*BOX\b|#\s*\d)/i;
+const LINE_GAP = 30;  // pt; lines further apart than this aren't part of the same address block
 // Numbered companies ("1001116790 LTD O/A …") are names even though they start with digits.
 const NUMBERED_COMPANY = /^\d{6,10}\s+(?:ONTARIO\s+|CANADA\s+)?(?:LTD|LIMITED|INC|CORP|CORPORATION)\b/i;
 const COL_TOL = 14;   // pt; how far segments may drift and still count as one column
@@ -436,7 +440,7 @@ function parseServiceAddress(raw) {
   let s = raw.replace(/\s+/g, ' ').trim().replace(/[,\s]+$/, '');
   let postal = '';
   const pm = s.match(new RegExp(POSTAL.source + '$', 'i'));
-  if (pm) { postal = fmtPostal(pm[0]); s = s.slice(0, pm.index).trim(); }
+  if (pm) { postal = fmtPostal(pm[0]); s = s.slice(0, pm.index).replace(/[,\s]+$/, ''); }
   s = s.replace(/,?\s*\b(?:ON|ONT|ONTARIO)\.?$/i, '').replace(/[,\s]+$/, '');
   let address = s, city = '';
   const comma = s.lastIndexOf(',');
@@ -460,7 +464,14 @@ function extractServiceAddress(segments) {
     const m = s.text.match(SERVICE_LABEL);
     if (!m) continue;
     const inline = s.text.slice(m.index + m[0].length).trim();
-    if (STREET.test(inline)) return parseServiceAddress(inline);
+    if (STREET.test(inline)) {
+      // The city and postal code may be on the next line down (Enova: "KITCHENER ON, N2P 1X3").
+      const below = segments
+        .filter(t => t.page === s.page && Math.abs(t.x - s.x) <= COL_TOL && s.y - t.y > 3 && s.y - t.y < 20)
+        .sort((a, b) => b.y - a.y)[0];
+      const tail = below && (POSTAL.test(below.text) || /\b(?:ON|ONTARIO)\b/.test(below.text)) ? ', ' + below.text : '';
+      return parseServiceAddress(inline + tail);
+    }
     // Value in the column to the right of the label: skip any name line, take the
     // street line, plus a city/postal line directly under it if there is one.
     const right = segments
@@ -490,20 +501,29 @@ const UTILITY_CITY = {
   'Burlington Hydro': 'BURLINGTON', 'Milton Hydro': 'MILTON',
 };
 
-// Name + billing postal: find a mailing block (street segment followed by a postal
-// segment in the SAME column), then read up to 3 uppercase name lines above it.
+// Name + billing postal: find a mailing block (street segment, optionally a suite or
+// P.O. box line, then a postal segment, all in the SAME column on the same page), then
+// read up to 3 uppercase name lines above it.
 // Restricting to one column matters: on a wide bill the segments immediately
 // before and after the street line belong to an unrelated right-hand column.
+// A block with a name wins. The utility's own address ("301 Victoria Street South /
+// P.O. BOX 9021 / Kitchener, ON") has the same shape but no uppercase name above it.
 function extractNameAndPostal(segments) {
+  let nameless = null;
   for (let i = 0; i < segments.length; i++) {
     if (!STREET.test(segments[i].text)) continue;
-    const col = segments.filter(s => Math.abs(s.x - segments[i].x) <= COL_TOL);
+    const col = segments.filter(s => s.page === segments[i].page && Math.abs(s.x - segments[i].x) <= COL_TOL);
     const k = col.indexOf(segments[i]);
-    if (k < 0 || k + 1 >= col.length || !POSTAL.test(col[k + 1].text)) continue;
+    let p = -1;
+    for (let q = k + 1; q < col.length && q <= k + 3 && col[q - 1].y - col[q].y <= LINE_GAP; q++) {
+      if (POSTAL.test(col[q].text)) { p = q; break; }
+      if (!ADDRESS_EXTRA.test(col[q].text)) break;
+    }
+    if (p < 0) continue;
 
-    const postal = fmtPostal(col[k + 1].text.match(POSTAL)[0]);
+    const postal = fmtPostal(col[p].text.match(POSTAL)[0]);
     const names = [];
-    for (let j = k - 1; j >= 0 && names.length < 3; j--) {
+    for (let j = k - 1; j >= 0 && names.length < 3 && col[j].y - col[j + 1].y <= LINE_GAP; j--) {
       const L = col[j].text.trim();
       if (!L || (/^\d/.test(L) && !NUMBERED_COMPANY.test(L)) || NAME_STOP.test(L)) break;
       const letters = (L.match(/[A-Za-z]/g) || []).length;
@@ -513,8 +533,10 @@ function extractNameAndPostal(segments) {
     }
     // Keep the whole addressee block: the top line is the account holder, any
     // lines below it are the parent company or a care-of line.
-    return { name: names.join(' / '), postal };
+    if (names.length) return { name: names.join(' / '), postal };
+    if (!nameless) nameless = { name: '', postal, guessed: true };
   }
+  if (nameless) return nameless;
   // Fallback: any postal in the doc (last one), no name. This can be the utility's own
   // address, so it's marked as guessed and highlighted for checking.
   const all = segments.map(s => s.text).join('\n').match(POSTAL_G);
@@ -546,7 +568,7 @@ async function handleFiles(fileList) {
             number: repairedNote(number),
             premise: repairedNote(premise),
             city: inferCity ? `the bill doesn't print the city, so it was filled in from the utility (${utility} only serves one city)` : '',
-            billingPostal: guessed ? `no mailing address block was found, so this is the last postal code on the bill and may be the utility's own address` : '',
+            billingPostal: guessed ? `no mailing address with a company name above it was found, so this postal code was guessed and may be the utility's own address` : '',
           },
         };
       };
